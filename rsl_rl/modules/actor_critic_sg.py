@@ -77,23 +77,21 @@ class ActorCriticSG(nn.Module):
         if torch.isnan(observations).any():
             raise RuntimeError(f"observations NAN")
         mean = self.actor(observations)
-        std = torch.clamp_min(torch.exp(self.log_std), 1e-8).expand_as(mean)
+        std = torch.clamp_min(torch.exp(self.log_std), 1e-6).expand_as(mean)
         self.distribution = Normal(mean, std)
-
 
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
         sampled = torch.tanh(self.distribution.rsample())  # -> squashed Gaussian to [-1, 1]
         if torch.isnan(sampled).any():
-            raise RuntimeError(f"sampled NAN")
+            raise RuntimeError("sampled NAN")
         return sampled
 
     def get_actions_log_prob(self, actions):
         with torch.autograd.set_detect_anomaly(True, check_nan=True):
-            a = torch.clamp(actions, -1 + 1e-6, 1 - 1e-6)
-            raw_actions = torch.atanh(a)
+            raw_actions = torch.atanh(actions)
             log_prob = self.distribution.log_prob(raw_actions)
-            log_prob -= torch.log((torch.pi / 2) * (1 - a.pow(2)) + 1e-6)
+            log_prob -= torch.log((1 - actions.pow(2)) + 1e-6)
             if not torch.isfinite(log_prob).all():
                 bad = log_prob[~torch.isfinite(log_prob)]
                 raise RuntimeError(f"log_prob turned non‑finite, sample: {bad[:4]}")
