@@ -166,7 +166,13 @@ class PPO:
                 if torch.isnan(delta).any():
                     raise RuntimeError("delta nan")
                 # Surrogate loss
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+
+                try:
+                    ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                except RuntimeError as e:
+                    print((actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)).max())
+                    raise Exception(e)
+
                 surrogate = -torch.squeeze(advantages_batch) * ratio
                 surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param

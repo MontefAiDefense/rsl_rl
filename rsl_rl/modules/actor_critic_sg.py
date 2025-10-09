@@ -93,6 +93,8 @@ class ActorCriticSG(nn.Module):
         sampled = torch.tanh(self.distribution.rsample())  # -> squashed Gaussian to [-1, 1]
         if torch.isnan(sampled).any():
             raise RuntimeError("sampled NAN")
+        print("Sampled:", sampled)
+        print("finfo: ", torch.finfo())
         return sampled
 
     def get_actions_log_prob(self, actions):
@@ -101,8 +103,12 @@ class ActorCriticSG(nn.Module):
             #     print(actions)
             a = torch.clamp(actions, -1 + 1e-6, 1 - 1e-6)
             raw_actions = torch.atanh(a)
+            print("raw_actions: ", raw_actions)
+            exit()
             log_prob = self.distribution.log_prob(raw_actions)  # log prob gaussian
             log_prob -= torch.log((1 - a.pow(2)) + 1e-6)  # log prob tanh
+            print("Mean: ", self.action_mean)
+            print("Std: ", self.action_std)
             if not torch.isfinite(log_prob).all():
                 bad = log_prob[~torch.isfinite(log_prob)]
                 raise RuntimeError(f"log_prob turned non‑finite, sample: {bad[:4]}")
@@ -116,9 +122,11 @@ class ActorCriticSG(nn.Module):
         value = self.critic(critic_observations)
         return value
 
+
 def check_stats_mean(module, inp, out):
     if torch.isnan(out).any():
         raise RuntimeError("Invalid mean detected")
+
 
 def create_mlp(input_dim, hidden_dims, activation, output_dim=None):
     layers = []
