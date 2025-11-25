@@ -32,7 +32,7 @@ class ActorCriticRecurrent(nn.Module):
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         rnn_type: str = "lstm",
-        rnn_hidden_dim: int = 256,
+        rnn_hidden_dim: int = 128,
         rnn_num_layers: int = 1,
         **kwargs: dict[str, Any],
     ) -> None:
