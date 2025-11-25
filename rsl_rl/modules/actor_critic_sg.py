@@ -204,13 +204,11 @@ class ActorCriticSG(nn.Module):
         super().load_state_dict(state_dict, strict=strict)
         return True
 
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (x.log1p() - (-x).log1p())
 
-@staticmethod
-def atanh(x):
-    return 0.5 * (x.log1p() - (-x).log1p())
-
-
-@staticmethod
-def inverse_tanh(y):
-    eps = torch.finfo(y.dtype).eps
-    return ActorCriticSG.atanh(y.clamp(min=-1.0 + eps, max=1.0 - eps))
+    @staticmethod
+    def inverse_tanh(y):
+        eps = torch.finfo(y.dtype).eps
+        return ActorCriticSG.atanh(y.clamp(min=-1.0 + eps, max=1.0 - eps))
