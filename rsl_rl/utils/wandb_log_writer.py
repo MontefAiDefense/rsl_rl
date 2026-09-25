@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from rsl_rl.utils.log_writer import LogWriter
 
 try:
-    import wandb  # type: ignore
+    import wandb
 except ModuleNotFoundError:
     wandb = None
 
@@ -42,6 +42,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
+            settings=wandb.Settings(start_method="thread"),
         )
 
         # Initialize set to keep track of logged videos
