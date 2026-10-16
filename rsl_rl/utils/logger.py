@@ -54,6 +54,8 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        # Per-step (done mask, [return, length, ...]) of finished episodes, moved to the host buffers by log().
+        self._pending_episodes: list[tuple[torch.Tensor, list[torch.Tensor]]] = []
 
         # Create RND buffers
         if self.cfg["algorithm"]["rnd_cfg"]:
@@ -141,17 +143,26 @@ class Logger:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
 
-            # Clear data for completed episodes
-            new_ids = (dones > 0).nonzero(as_tuple=False)
-            self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-            self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 0
+            # Record and clear completed episodes without a host sync
+            done = dones > 0
+            sums = [self.cur_reward_sum, self.cur_episode_length]
             if intrinsic_rewards is not None:
-                self.erewbuffer.extend(self.cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                self.cur_ereward_sum[new_ids] = 0
-                self.cur_ireward_sum[new_ids] = 0
+                sums += [self.cur_ereward_sum, self.cur_ireward_sum]
+            self._pending_episodes.append((done, [torch.where(done, x, 0.0) for x in sums]))
+            for x in sums:
+                x.masked_fill_(done, 0)
+
+    def _flush_episodes(self) -> None:
+        """Move the finished episodes recorded since the last call to the host buffers, in step then env order."""
+        if not self._pending_episodes:
+            return
+        done = torch.stack([d for d, _ in self._pending_episodes])
+        buffers = [self.rewbuffer, self.lenbuffer]
+        if len(self._pending_episodes[0][1]) == 4:
+            buffers += [self.erewbuffer, self.irewbuffer]
+        for i, buffer in enumerate(buffers):
+            buffer.extend(torch.stack([values[i] for _, values in self._pending_episodes])[done].tolist())
+        self._pending_episodes.clear()
 
     def log(
         self,
@@ -173,6 +184,7 @@ class Logger:
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
         if self.writer is not None:
+            self._flush_episodes()
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
             self.tot_timesteps += collection_size

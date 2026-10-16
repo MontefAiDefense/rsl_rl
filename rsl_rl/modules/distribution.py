@@ -192,7 +192,10 @@ class GaussianDistribution(Distribution):
 
     def sample(self) -> torch.Tensor:
         """Sample from the Gaussian distribution."""
-        return self._distribution.sample()  # type: ignore
+        # torch.normal(loc, scale) computes exactly this, after a host-side scale >= 0 check that syncs with the GPU.
+        loc, scale = self._distribution.loc, self._distribution.scale  # type: ignore
+        with torch.no_grad():
+            return torch.empty_like(loc, memory_format=torch.contiguous_format).normal_().mul_(scale).add_(loc)
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output."""
