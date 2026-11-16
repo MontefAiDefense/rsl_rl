@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import torch
+from pathlib import Path
 from tensordict import TensorDict
+
+import pytest
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from tests.conftest import make_obs
+from tests.conftest import make_obs, run_distributed
 
 NUM_ENVS = 4
 NUM_STEPS = 8
@@ -318,3 +321,66 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+def _train_one_iteration(
+    rank: int, world_size: int, data: dict[str, torch.Tensor], per_mini_batch: bool, multi_gpu: bool
+) -> dict:
+    """Run one PPO rollout and update on this rank's share of the environments and return the results."""
+    envs = slice(None) if not multi_gpu else torch.arange(data["rewards"].shape[1]).chunk(world_size)[rank]
+    obs_seq = [TensorDict({"policy": o[envs]}, batch_size=[o[envs].shape[0]]) for o in data["obs"]]
+    num_envs = obs_seq[0].batch_size[0]
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    torch.manual_seed(0)
+    actor = _make_actor(obs_seq[0], obs_groups, NUM_ACTIONS, obs_normalization=True)
+    critic = _make_critic(obs_seq[0], obs_groups, obs_normalization=True)
+    storage = RolloutStorage("rl", num_envs, NUM_STEPS, obs_seq[0], [NUM_ACTIONS])
+    multi_gpu_cfg = {"global_rank": rank, "world_size": world_size} if multi_gpu else None
+    ppo = PPO(
+        actor,
+        critic,
+        storage,
+        num_learning_epochs=2,
+        num_mini_batches=1,
+        schedule="fixed",
+        normalize_advantage_per_mini_batch=per_mini_batch,
+        multi_gpu_cfg=multi_gpu_cfg,
+    )
+    normalized = []
+    normalize = ppo._normalize_advantages
+    ppo._normalize_advantages = lambda advantages: normalized.append(normalize(advantages)) or normalized[-1]
+    for step in range(NUM_STEPS):
+        ppo.act(obs_seq[step])
+        ppo.transition.actions = data["actions"][step][envs]
+        ppo.transition.actions_log_prob = ppo.actor.get_output_log_prob(ppo.transition.actions).detach()
+        ppo.process_env_step(obs_seq[step + 1], data["rewards"][step][envs], data["dones"][step][envs], {})
+    ppo.compute_returns(obs_seq[-1])
+    ppo.update()
+    return {"actor": ppo.actor.state_dict(), "critic": ppo.critic.state_dict(), "advantages": normalized[0]}
+
+
+class TestMultiGPU:
+    """Two gloo processes, each holding half the environments, train one shared model."""
+
+    @pytest.mark.parametrize("per_mini_batch", [False, True])
+    def test_ranks_share_statistics_and_weights(self, tmp_path: Path, per_mini_batch: bool) -> None:
+        """Normalizers match one process that saw every env, advantages are normalized globally, weights match."""
+        gen = torch.Generator().manual_seed(1)
+        num_envs = 2 * NUM_ENVS
+        data = {
+            "obs": [3.0 + 2.0 * torch.randn(num_envs, OBS_DIM, generator=gen) for _ in range(NUM_STEPS + 1)],
+            "actions": torch.randn(NUM_STEPS, num_envs, NUM_ACTIONS, generator=gen),
+            "rewards": torch.randn(NUM_STEPS, num_envs, generator=gen),
+            "dones": (torch.rand(NUM_STEPS, num_envs, generator=gen) < 0.1).float(),
+        }
+        ref = _train_one_iteration(0, 1, data, per_mini_batch, multi_gpu=False)
+
+        outs = run_distributed(_train_one_iteration, 2, tmp_path, data, per_mini_batch, True)
+        advantages = torch.cat([out["advantages"].flatten() for out in outs])
+        torch.testing.assert_close(advantages.mean(), torch.tensor(0.0), atol=1e-6, rtol=0)
+        torch.testing.assert_close(advantages.std(), torch.tensor(1.0))
+        for model in ("actor", "critic"):
+            for key in ("obs_normalizer._mean", "obs_normalizer._std", "obs_normalizer.count"):
+                torch.testing.assert_close(outs[0][model][key], ref[model][key])
+            for key, value in outs[0][model].items():
+                assert torch.equal(outs[1][model][key], value), f"{model} {key} differs between ranks"

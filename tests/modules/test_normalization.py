@@ -5,9 +5,45 @@
 
 """Tests for normalization modules."""
 
+from __future__ import annotations
+
 import torch
+from pathlib import Path
+
+import pytest
 
 from rsl_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from tests.conftest import run_distributed
+
+# Per-rank batch sizes differ on purpose: ranks may hold different numbers of environments.
+RANK_ROWS = (3, 5)
+
+
+def _rank_batches(rank: int, batches: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Split each batch into the rows of ``rank``."""
+    return [b.split(RANK_ROWS)[rank] for b in batches]
+
+
+def _update_on_rank(rank: int, world_size: int, rounds: list[list[torch.Tensor]], resume: dict | None) -> dict:
+    norm = EmpiricalNormalization(shape=rounds[0][0].shape[1:])
+    if resume is not None:
+        norm.load_state_dict(resume)
+    for batches in rounds:
+        for batch in _rank_batches(rank, batches):
+            norm.update(batch)
+        norm.sync()
+    norm.eval()
+    norm.update(_rank_batches(rank, rounds[0])[0] + 100.0)
+    norm.sync()
+    return {"count": norm.count, "mean": norm.mean, "std": norm.std}
+
+
+def _reward_normalizer_on_rank(rank: int, world_size: int, rewards: list[torch.Tensor]) -> dict:
+    norm = EmpiricalDiscountedVariationNormalization(shape=[])
+    for reward in _rank_batches(rank, rewards):
+        norm(reward)
+    norm.emp_norm.sync()
+    return {"mean": norm.emp_norm.mean, "std": norm.emp_norm.std}
 
 
 class TestEmpiricalNormalization:
@@ -93,6 +129,59 @@ class TestEmpiricalNormalization:
 
         assert not torch.any(torch.isnan(norm._mean))
         assert not torch.any(torch.isnan(norm._std))
+
+
+class TestDistributedNormalization:
+    """After ``sync``, normalizers in a process group hold the statistics of one process that saw every batch."""
+
+    @pytest.mark.parametrize("resume", [False, True])
+    def test_ranks_match_one_process_with_all_rows(self, tmp_path: Path, resume: bool) -> None:
+        """Unequal per-rank batches over several syncs, from scratch or a loaded state, match the concatenated run."""
+        torch.manual_seed(0)
+        rounds = [[3.0 + 2.0 * torch.randn(sum(RANK_ROWS), 2, 3) for _ in range(3)] for _ in range(2)]
+        ref = EmpiricalNormalization(shape=(2, 3))
+        state = None
+        if resume:
+            ref.update(torch.randn(11, 2, 3))
+            state = {k: v.clone() for k, v in ref.state_dict().items()}
+        for batches in rounds:
+            for batch in batches:
+                ref.update(batch)
+
+        for out in run_distributed(_update_on_rank, 2, tmp_path, rounds, state):
+            assert out["count"] == ref.count
+            torch.testing.assert_close(out["mean"], ref.mean)
+            torch.testing.assert_close(out["std"], ref.std)
+
+    def test_constant_input_gives_zero_std(self, tmp_path: Path) -> None:
+        """A large constant input must give a zero std, not a NaN from a negative variance."""
+        rounds = [[torch.full((sum(RANK_ROWS), 4), 12345.678)] * 3]
+        for out in run_distributed(_update_on_rank, 2, tmp_path, rounds, None):
+            assert torch.equal(out["std"], torch.zeros(4))
+
+    def test_reward_normalizer_matches_one_process(self, tmp_path: Path) -> None:
+        """The scalar-shaped normalizer inside the discounted reward normalizer syncs too."""
+        torch.manual_seed(0)
+        rewards = [torch.rand(sum(RANK_ROWS)) for _ in range(5)]
+        ref = EmpiricalDiscountedVariationNormalization(shape=[])
+        for reward in rewards:
+            ref(reward)
+
+        for out in run_distributed(_reward_normalizer_on_rank, 2, tmp_path, rewards):
+            torch.testing.assert_close(out["mean"], ref.emp_norm.mean)
+            torch.testing.assert_close(out["std"], ref.emp_norm.std)
+
+    def test_update_issues_no_collective(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The per-step update stays local, so a CUDA graph can capture it; only ``sync`` communicates."""
+
+        def no_collective(*args: object, **kwargs: object) -> None:
+            raise AssertionError("update() must not communicate")
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_reduce", no_collective)
+        norm = EmpiricalNormalization(shape=3)
+        norm.update(torch.randn(5, 3))
+        assert norm._batch_count == 5
 
 
 class TestEmpiricalDiscountedVariationNormalization:
