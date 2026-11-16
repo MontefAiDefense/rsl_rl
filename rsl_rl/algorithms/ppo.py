@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import EmpiricalNormalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -162,6 +163,8 @@ class PPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions."""
+        if self.is_multi_gpu:
+            self._sync_normalizers()
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
@@ -185,7 +188,7 @@ class PPO:
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            st.advantages = self._normalize_advantages(st.advantages)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -210,7 +213,7 @@ class PPO:
             # Check if we should normalize advantages per mini-batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+                    batch.advantages = self._normalize_advantages(batch.advantages)  # type: ignore
 
             # Perform symmetric augmentation if enabled
             if self.symmetry:
@@ -461,6 +464,25 @@ class PPO:
         self._raw_critic.load_state_dict(model_params[1])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
+
+    def _sync_normalizers(self) -> None:
+        """Merge the batches of all GPUs since the last call into every empirical normalizer."""
+        modules = [self._raw_actor, self._raw_critic, *([self.rnd] if self.rnd else [])]
+        for module in chain.from_iterable(m.modules() for m in modules):
+            if isinstance(module, EmpiricalNormalization):
+                module.sync()
+
+    def _normalize_advantages(self, advantages: torch.Tensor) -> torch.Tensor:
+        """Normalize advantages by their mean and unbiased std, taken over all GPUs in multi-GPU training."""
+        if not self.is_multi_gpu:
+            return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        adv = advantages.double()
+        moments = torch.stack((adv.new_tensor(adv.numel()), adv.sum(), adv.square().sum()))
+        torch.distributed.all_reduce(moments)
+        count, total, total_sq = moments
+        mean = total / count
+        std = ((total_sq - count * mean.square()) / (count - 1)).clamp_min(0.0).sqrt()
+        return (advantages - mean.to(advantages.dtype)) / (std.to(advantages.dtype) + 1e-8)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
