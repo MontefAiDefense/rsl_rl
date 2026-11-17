@@ -275,14 +275,10 @@ class Distillation:
         return alg
 
     def broadcast_parameters(self) -> None:
-        """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
-        model_params = [self._raw_student.state_dict(), self._raw_teacher.state_dict()]
-        # Broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
-        self._raw_student.load_state_dict(model_params[0])
-        self._raw_teacher.load_state_dict(model_params[1])
+        """Broadcast the parameters and buffers of the models from GPU 0 to all GPUs."""
+        for module in (self._raw_student, self._raw_teacher):
+            for tensor in [*module.parameters(), *module.buffers()]:
+                torch.distributed.broadcast(tensor.data, src=0)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
